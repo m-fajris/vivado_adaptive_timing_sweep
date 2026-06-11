@@ -55,14 +55,14 @@
 # ==============================================================================
 
 # Top-level clock input port name (must match your XDC get_ports line).
-set CFG_CLK_PORT  "clk"
+set CFG_CLK_PORT  "clk_i"
 
 # Vivado run names.
 set CFG_SYNTH_RUN "synth_1"
 set CFG_IMPL_RUN  "impl_1"
 
 # Parallel jobs -- set to your physical core count.
-set CFG_JOBS 16
+set CFG_JOBS 8
 
 # Search bounds (ns).
 #   PERIOD_MIN: fastest you'd ever expect (Artix-7 practical limit ~3 ns).
@@ -724,12 +724,34 @@ if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
     puts "Resolution: $F_MIN_STEP ns"
     puts "Max iters : $F_MAX_ITER"
 
+    # lo_verified: becomes 1 the first time a FAIL updates lo.
+    # If it stays 0 at convergence, lo was never tested -- true Fmax may be faster.
+    set lo_verified 0
+
     for {set iter 1} {$iter <= $F_MAX_ITER} {incr iter} {
 
         set gap [expr {$fine_hi - $fine_lo}]
+
+        # If gap is small but lo was never verified as a real fail,
+        # extend lo downward and keep searching rather than stopping early.
         if {$gap < $F_MIN_STEP} {
-            puts "\nGap [ats_fmt $gap] ns < $F_MIN_STEP ns -- converged."
-            break
+            if {!$lo_verified} {
+                set new_lo [ats_clamp \
+                    [expr {$fine_lo - ($fine_hi - $fine_lo) * 4}] \
+                    $CFG_PERIOD_MIN \
+                    [expr {$fine_lo - $F_MIN_STEP}]]
+                if {$new_lo <= $CFG_PERIOD_MIN} {
+                    puts "\nGap converged but lo never verified -- hit PERIOD_MIN floor."
+                    puts "Reported Fmax may be conservative. Lower CFG_PERIOD_MIN to search faster."
+                    break
+                }
+                puts "\nGap [ats_fmt $gap] ns < $F_MIN_STEP ns but lo never failed."
+                puts "Extending lo to [ats_fmt $new_lo] ns to find true lower bound..."
+                set fine_lo $new_lo
+            } else {
+                puts "\nGap [ats_fmt $gap] ns < $F_MIN_STEP ns -- converged."
+                break
+            }
         }
 
         set mid [expr {($fine_lo + $fine_hi) / 2.0}]
@@ -745,6 +767,7 @@ if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
         if {![dict get $rr ok]} {
             puts "  Run error -- treating as fail, moving lo up."
             set fine_lo $mid
+            set lo_verified 1
             continue
         }
 
@@ -772,6 +795,7 @@ if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
             set dec "PASS_try_faster"
         } else {
             set fine_lo $mid
+            set lo_verified 1
             set dec "FAIL_try_slower"
         }
 
