@@ -75,11 +75,13 @@ set CFG_PERIOD_MIN           2.000
 set CFG_PERIOD_MAX           12.000
 set CFG_COARSE_PERIOD_START  ""     ;# ns, or "" to use PERIOD_MAX
 
-# Validation seeds.
-#   {1}       = single seed, fast, no confirmation
-#   {1 2 3}   = 3 seeds, recommended for paper results
-#   {1 2 3 4 5} = 5 seeds, high confidence
-set CFG_VALIDATION_SEEDS {1 2 3}
+# Validation directives.
+# Vivado has NO placement seed (P&R is deterministic) -- running the same
+# period N times gives bit-identical results. The legitimate way to test
+# implementation diversity is different placer directives:
+#   {Default}                              = single run, no diversity check
+#   {Default Explore ExtraNetDelay_high}   = recommended for paper results
+set CFG_VALIDATION_DIRECTIVES {Default Explore ExtraNetDelay_high}
 
 # Stop the search if hold slack (WHS) goes negative.
 # Usually leave as 0 -- hold violations are fixable separately.
@@ -381,17 +383,21 @@ proc ats_collect {impl_run out_dir tag} {
                  dsp [ats_count_cells DSP*]    status $st]
 }
 
-# Set P&R seed on implementation run.
-proc ats_set_seed {impl_run seed} {
-    catch {
-        set_property {STEPS.PLACE_DESIGN.ARGS.MORE OPTIONS} \
-            "-seed $seed" [get_runs $impl_run]
+# Set placer directive on implementation run (Vivado's legitimate way to
+# get implementation diversity -- there is NO placement seed in Vivado,
+# P&R is deterministic given identical inputs).
+proc ats_set_directive {impl_run directive} {
+    if {[catch {
+        set_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE $directive [get_runs $impl_run]
+    } err]} {
+        puts "  WARNING: Could not set place directive '$directive': $err"
+        return 0
     }
+    return 1
 }
-proc ats_clear_seed {impl_run} {
+proc ats_clear_directive {impl_run} {
     catch {
-        set_property {STEPS.PLACE_DESIGN.ARGS.MORE OPTIONS} \
-            "" [get_runs $impl_run]
+        set_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE Default [get_runs $impl_run]
     }
 }
 
@@ -483,6 +489,7 @@ set CKPT_best_coarse_wns "NA"
 set CKPT_fine_lo         $CFG_PERIOD_MIN
 set CKPT_fine_hi         "NA"
 set CKPT_best_fine       "NA"
+set CKPT_lo_verified     0
 set CKPT_val_done_seeds  {}
 set CKPT_val_wns_list    {}
 set CKPT_val_pass_list   {}
@@ -658,12 +665,25 @@ if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
 
     ats_banner "PHASE 2  --  FINE  (binary search)"
 
+    # lo_verified: 1 once any real FAIL has established the lower bound.
+    # Restored from checkpoint on resume so a completed fine phase is not
+    # re-extended and re-run.
+    set lo_verified $CKPT_lo_verified
+
+    # If fine already completed (resume into validation), skip the loop.
+    set fine_already_done [expr {$_resumed && \
+        ($CKPT_phase eq "fine_done" || $CKPT_phase eq "validate") && \
+        $CKPT_best_fine ne "NA"}]
+
     # Restore fine bounds from checkpoint if resuming.
     if {$_resumed && $CKPT_fine_hi ne "NA"} {
         set fine_lo $CKPT_fine_lo
         set fine_hi $CKPT_fine_hi
         set best_f  $CKPT_best_fine
         puts "Resumed: lo=[ats_fmt $fine_lo]  hi=[ats_fmt $fine_hi]  best=[ats_fmt $best_f]"
+        if {$fine_already_done} {
+            puts "Fine phase already completed -- skipping straight to validation."
+        }
     } else {
         set fine_hi $fine_hi_start
 
@@ -709,10 +729,12 @@ if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
             if {$vpass} {
                 set best_f $fine_hi
             } else {
-                # Hi bound doesn't pass -- expand and warn.
+                # Hi bound doesn't pass -- this is a REAL verified fail,
+                # so the new lo is confirmed.
                 puts "  WARNING: Hi bound fails."
                 puts "  Try a larger FINE_PERIOD_START, e.g. [ats_fmt [expr {$fine_hi + 1.0}]] ns"
                 set fine_lo $fine_hi
+                set lo_verified 1
                 set fine_hi [ats_clamp [expr {$fine_hi + 1.500}] $CFG_PERIOD_MIN $CFG_PERIOD_MAX]
                 puts "  Expanded hi to [ats_fmt $fine_hi] ns -- continuing..."
             }
@@ -724,11 +746,7 @@ if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
     puts "Resolution: $F_MIN_STEP ns"
     puts "Max iters : $F_MAX_ITER"
 
-    # lo_verified: becomes 1 the first time a FAIL updates lo.
-    # If it stays 0 at convergence, lo was never tested -- true Fmax may be faster.
-    set lo_verified 0
-
-    for {set iter 1} {$iter <= $F_MAX_ITER} {incr iter} {
+    for {set iter 1} {$iter <= $F_MAX_ITER && !$fine_already_done} {incr iter} {
 
         set gap [expr {$fine_hi - $fine_lo}]
 
@@ -736,8 +754,13 @@ if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
         # extend lo downward and keep searching rather than stopping early.
         if {$gap < $F_MIN_STEP} {
             if {!$lo_verified} {
+                # Extension floor of 0.250 ns: 4*gap alone is tiny when gap
+                # has already converged (<0.1 ns), and intermediate passes
+                # shrink it again -- without a floor, crossing a mis-bracketed
+                # region of 0.5 ns could exhaust F_MAX_ITER.
+                set _ext [expr {max(4.0 * $gap, 0.250)}]
                 set new_lo [ats_clamp \
-                    [expr {$fine_lo - ($fine_hi - $fine_lo) * 4}] \
+                    [expr {$fine_lo - $_ext}] \
                     $CFG_PERIOD_MIN \
                     [expr {$fine_lo - $F_MIN_STEP}]]
                 if {$new_lo <= $CFG_PERIOD_MIN} {
@@ -808,14 +831,18 @@ if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
 
         ats_save_ckpt $CKPT_FILE \
             coarse_done $CKPT_coarse_done  best_coarse $CKPT_best_coarse \
+            best_coarse_wns $CKPT_best_coarse_wns \
             fine_lo $fine_lo  fine_hi $fine_hi  best_fine $best_f \
+            lo_verified $lo_verified \
             phase fine
     }
 
     set CKPT_best_fine $best_f
     ats_save_ckpt $CKPT_FILE \
         coarse_done $CKPT_coarse_done  best_coarse $CKPT_best_coarse \
+        best_coarse_wns $CKPT_best_coarse_wns \
         fine_lo $fine_lo  fine_hi $fine_hi  best_fine $best_f \
+        lo_verified $lo_verified \
         phase fine_done
 
     puts ""
@@ -826,10 +853,10 @@ if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
     # VALIDATION  --  multi-seed at best period
     # ============================================================================
 
-    if {$best_f ne "NA" && [llength $CFG_VALIDATION_SEEDS] > 0} {
+    if {$best_f ne "NA" && [llength $CFG_VALIDATION_DIRECTIVES] > 0} {
 
-        ats_banner "VALIDATION  --  [ats_fmt $best_f] ns  ([ats_mhz $best_f])  x[llength $CFG_VALIDATION_SEEDS] seeds"
-        puts "Seeds: $CFG_VALIDATION_SEEDS"
+        ats_banner "VALIDATION  --  [ats_fmt $best_f] ns  ([ats_mhz $best_f])  x[llength $CFG_VALIDATION_DIRECTIVES] directives"
+        puts "Directives: $CFG_VALIDATION_DIRECTIVES"
         puts "RERUN_SYNTH: $V_RERUN_SYNTH"
 
         # Restore accumulated results from checkpoint (resume case).
@@ -837,30 +864,32 @@ if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
         set val_pass $CKPT_val_pass_list
 
         if {[llength $CKPT_val_done_seeds] > 0} {
-            puts "Resuming validation -- already done seeds: $CKPT_val_done_seeds"
+            puts "Resuming validation -- already done: $CKPT_val_done_seeds"
         }
 
-        foreach seed $CFG_VALIDATION_SEEDS {
+        set _dir_idx 0
+        foreach directive $CFG_VALIDATION_DIRECTIVES {
+            incr _dir_idx
 
-            # Skip seeds already completed in a previous run.
-            if {[lsearch -exact $CKPT_val_done_seeds $seed] >= 0} {
+            # Skip directives already completed in a previous run.
+            if {[lsearch -exact $CKPT_val_done_seeds $directive] >= 0} {
                 puts ""
-                puts "-- Seed $seed  (already done, skipping)"
+                puts "-- Directive '$directive'  (already done, skipping)"
                 continue
             }
 
             puts ""
-            puts "-- Seed $seed"
-            ats_set_seed  $CFG_IMPL_RUN $seed
+            puts "-- Directive '$directive'"
+            ats_set_directive $CFG_IMPL_RUN $directive
             ats_write_xdc $XDC_FILE $CFG_CLK_PORT $CLK_NAME $best_f
 
             set rr [ats_run_impl $CFG_SYNTH_RUN $CFG_IMPL_RUN $CFG_JOBS $V_RERUN_SYNTH]
             if {![dict get $rr ok]} {
-                puts "  Run error on seed $seed -- skipping."
+                puts "  Run error on directive '$directive' -- skipping."
                 continue
             }
 
-            set tag [format "val_s%02d_%s" $seed [regsub -all {[^0-9]} [ats_fmt $best_f] "_"]]
+            set tag [format "val_d%02d_%s" $_dir_idx [regsub -all {[^0-9]} [ats_fmt $best_f] "_"]]
             set res [ats_collect $CFG_IMPL_RUN $CFG_OUT_DIR $tag]
             set wns  [dict get $res wns]
             set pass [dict get $res pass]
@@ -868,18 +897,18 @@ if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
 
             puts "  WNS=[ats_fmt $wns]  PASS=$pass"
 
-            ats_csv_row $CSV validate 0 $best_f $wns [dict get $res whs] \
+            ats_csv_row $CSV validate $_dir_idx $best_f $wns [dict get $res whs] \
                 [dict get $res lut] [dict get $res ff] \
                 [dict get $res b18] [dict get $res b36] [dict get $res dsp] \
-                $seed $st [expr {$pass ? "PASS" : "FAIL"}]
+                $directive $st [expr {$pass ? "PASS" : "FAIL"}]
 
             if {[ats_num $wns]} {
                 lappend val_wns  $wns
                 lappend val_pass $pass
             }
 
-            # Save after each seed so a crash here doesn't lose progress.
-            lappend CKPT_val_done_seeds $seed
+            # Save after each directive so a crash here doesn't lose progress.
+            lappend CKPT_val_done_seeds $directive
             set _vlo [expr {[info exists fine_lo] ? $fine_lo : $CKPT_fine_lo}]
             set _vhi [expr {[info exists fine_hi] ? $fine_hi : $CKPT_fine_hi}]
             ats_save_ckpt $CKPT_FILE \
@@ -888,13 +917,14 @@ if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
                 best_coarse_wns $CKPT_best_coarse_wns \
                 fine_lo $_vlo  fine_hi $_vhi \
                 best_fine $best_f \
+                lo_verified 1 \
                 val_done_seeds $CKPT_val_done_seeds \
                 val_wns_list  $val_wns \
                 val_pass_list $val_pass \
                 phase validate
         }
 
-        ats_clear_seed $CFG_IMPL_RUN
+        ats_clear_directive $CFG_IMPL_RUN
 
         if {[llength $val_wns] > 0} {
             set v_min    [lindex [lsort -real $val_wns] 0]
@@ -905,12 +935,14 @@ if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
 
             puts ""
             puts "Validation WNS: min=[ats_fmt $v_min]  median=[ats_fmt $v_med]  max=[ats_fmt $v_max]"
-            puts "Pass rate     : $v_passes / $v_total  seeds"
+            puts "Pass rate     : $v_passes / $v_total  directives"
 
             if {$v_min < 0.0} {
                 puts ""
-                puts "NOTE: At least one seed failed. The true Fmax is slightly slower."
-                puts "      Try fine phase with a slightly higher FINE_PERIOD_START."
+                puts "NOTE: At least one directive failed timing. The Fmax holds only for"
+                puts "      specific placer directives. For a conservative claim, report the"
+                puts "      result with the directive that passed, or rerun fine with a"
+                puts "      slightly higher FINE_PERIOD_START."
             }
         }
     }
@@ -943,9 +975,21 @@ if {$_report_period ne "NA"} {
     if {[info exists v_min]} {
         puts "  Validation WNS range: [ats_fmt $v_min] ~ [ats_fmt $v_max] ns  (median [ats_fmt $v_med] ns)"
     }
+    # Clean up the checkpoint only when the fine phase completed -- after a
+    # coarse-only run the checkpoint carries the coarse result into the next
+    # fine run and must be kept.
+    if {[info exists best_f] && $best_f ne "NA"} {
+        if {[file exists $CKPT_FILE]} {
+            catch {file delete $CKPT_FILE}
+            puts "  Checkpoint cleared -- next run starts fresh."
+        }
+    } else {
+        puts "  Checkpoint kept (coarse result) for the next fine run: $CKPT_FILE"
+    }
 } else {
     puts "  No passing result found."
     puts "  Check: $CFG_OUT_DIR/clocks_*.rpt and check_timing_*.rpt"
+    puts "  Checkpoint kept for resume: $CKPT_FILE"
 }
 
 puts ""
