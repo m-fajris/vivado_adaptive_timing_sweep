@@ -202,6 +202,20 @@ proc ats_count_cells {pat} {
     return [llength [get_cells -hierarchical -quiet -filter "REF_NAME =~ $pat"]]
 }
 
+# Parse a utilization value from report_utilization text output.
+# Matches table rows like:  | Slice LUTs  | 1847 |  0 | 63400 | 2.91 |
+# Returns the first "Used" column number after the row label, or 0.
+proc ats_parse_util {util_txt row_label} {
+    foreach line [split $util_txt "\n"] {
+        if {[string first $row_label $line] < 0} { continue }
+        # First numeric field after the label's column separator.
+        if {[regexp {\|\s*[^|]+\|\s*([0-9]+)} $line -> n]} {
+            return $n
+        }
+    }
+    return 0
+}
+
 proc ats_get_slack {delay_type} {
     set paths [get_timing_paths -quiet -delay_type $delay_type -max_paths 1]
     if {[llength $paths] == 0} { return "NA" }
@@ -368,7 +382,15 @@ proc ats_collect {impl_run out_dir tag} {
     } else {
         ats_write_file $t_rpt $txt
     }
-    catch {report_utilization  -file $u_rpt}
+    # Utilization: parse report_utilization so CSV matches the report exactly.
+    # (Counting LUT* cells overcounts: two small LUT cells can pack into one
+    #  fractured LUT6 site, so cell count can be ~2x the "Slice LUTs" figure.)
+    set util_txt ""
+    if {[catch {set util_txt [report_utilization -return_string]}]} {
+        catch {report_utilization -file $u_rpt}
+    } else {
+        ats_write_file $u_rpt $util_txt
+    }
     catch {report_clocks        -file $k_rpt}
     catch {check_timing -verbose -file $c_rpt}
 
@@ -377,10 +399,23 @@ proc ats_collect {impl_run out_dir tag} {
     set pass [expr {[ats_num $wns] && $wns >= 0.0}]
     set st   [get_property STATUS [get_runs $impl_run]]
 
+    if {$util_txt ne ""} {
+        set lut [ats_parse_util $util_txt "Slice LUTs"]
+        set ff  [ats_parse_util $util_txt "Slice Registers"]
+        set b18 [ats_parse_util $util_txt "RAMB18"]
+        set b36 [ats_parse_util $util_txt "RAMB36"]
+        set dsp [ats_parse_util $util_txt "DSPs"]
+    } else {
+        # Fallback: cell counts (may overcount LUTs due to packing).
+        set lut [ats_count_cells LUT*]
+        set ff  [ats_count_cells FD*]
+        set b18 [ats_count_cells RAMB18*]
+        set b36 [ats_count_cells RAMB36*]
+        set dsp [ats_count_cells DSP*]
+    }
+
     return [list ok 1 wns $wns whs $whs pass $pass \
-                 lut [ats_count_cells LUT*]    ff  [ats_count_cells FD*] \
-                 b18 [ats_count_cells RAMB18*] b36 [ats_count_cells RAMB36*] \
-                 dsp [ats_count_cells DSP*]    status $st]
+                 lut $lut ff $ff b18 $b18 b36 $b36 dsp $dsp status $st]
 }
 
 # Set placer directive on implementation run (Vivado's legitimate way to
