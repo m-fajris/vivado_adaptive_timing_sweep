@@ -329,7 +329,8 @@ Other useful directives for wider sweeps: `ExtraPostPlacementOpt`,
 - The `-name` argument must appear explicitly.
 
 ### `Hi bound fails` warning at start of fine phase
-- The coarse result was optimistic. Increase the buffer:
+- Only occurs with a manual `FINE_PERIOD_START` (when hi comes from coarse it
+  is already a verified pass and is not re-verified). Your guess was too fast:
   ```tcl
   set FINE_PERIOD_START 6.000   ;# try a slower starting point
   ```

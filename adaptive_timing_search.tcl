@@ -647,16 +647,22 @@ set best_f "NA"
 if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
 
     # --- Determine the initial hi bound ---
+    # hi_needs_verify: a manual FINE_PERIOD_START is an unverified guess and
+    # must be implemented once to confirm it passes. A coarse_best needs NO
+    # verification and NO buffer -- it just ran and passed, and Vivado P&R is
+    # deterministic (same netlist, same directive => identical result).
+    # Re-verifying it would waste one full implementation run, and adding a
+    # +0.5 ns buffer would widen the bracket by ~1 extra binary iteration.
     set fine_hi_start ""
+    set hi_needs_verify 1
 
     if {$FINE_PERIOD_START ne ""} {
         set fine_hi_start $FINE_PERIOD_START
-        puts "\nFine start: FINE_PERIOD_START = $fine_hi_start ns (manual)"
+        puts "\nFine start: FINE_PERIOD_START = $fine_hi_start ns (manual, will verify)"
     } elseif {$CKPT_best_coarse ne "NA"} {
-        # Buffer above coarse result to guarantee a pass at hi.
-        set fine_hi_start [expr {$CKPT_best_coarse + 0.500}]
-        set fine_hi_start [ats_clamp $fine_hi_start $CFG_PERIOD_MIN $CFG_PERIOD_MAX]
-        puts "\nFine start: coarse_best + 0.5 ns = [ats_fmt $fine_hi_start] ns"
+        set fine_hi_start $CKPT_best_coarse
+        set hi_needs_verify 0
+        puts "\nFine start: coarse_best = [ats_fmt $fine_hi_start] ns (already verified in coarse)"
     } else {
         error "Fine phase needs a starting period.\
                \nOption A: run full pipeline (SWEEP_MODE full).\
@@ -709,34 +715,42 @@ if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
 
         set best_f "NA"
 
-        # Verify that fine_hi actually passes before binary search starts.
-        puts "Verifying hi bound: [ats_fmt $fine_hi] ns  ([ats_mhz $fine_hi])"
-        ats_write_xdc $XDC_FILE $CFG_CLK_PORT $CLK_NAME $fine_hi
-        set rr [ats_run_impl $CFG_SYNTH_RUN $CFG_IMPL_RUN $CFG_JOBS $F_RERUN_SYNTH]
+        if {!$hi_needs_verify} {
+            # hi came from coarse -- it just ran and passed. Deterministic
+            # P&R means re-running it gives the identical result, so skip
+            # the verify implementation and seed best_f directly.
+            set best_f $fine_hi
+            puts "Hi bound [ats_fmt $fine_hi] ns verified by coarse -- skipping re-verification."
+        } else {
+            # Manual FINE_PERIOD_START: implement once to confirm it passes.
+            puts "Verifying hi bound: [ats_fmt $fine_hi] ns  ([ats_mhz $fine_hi])"
+            ats_write_xdc $XDC_FILE $CFG_CLK_PORT $CLK_NAME $fine_hi
+            set rr [ats_run_impl $CFG_SYNTH_RUN $CFG_IMPL_RUN $CFG_JOBS $F_RERUN_SYNTH]
 
-        if {[dict get $rr ok]} {
-            set vtag [format "fine_hi_verify_%s" [regsub -all {[^0-9]} [ats_fmt $fine_hi] "_"]]
-            set vres [ats_collect $CFG_IMPL_RUN $CFG_OUT_DIR $vtag]
-            set vwns [dict get $vres wns]
-            set vpass [dict get $vres pass]
-            puts "  WNS=[ats_fmt $vwns]  PASS=$vpass"
+            if {[dict get $rr ok]} {
+                set vtag [format "fine_hi_verify_%s" [regsub -all {[^0-9]} [ats_fmt $fine_hi] "_"]]
+                set vres [ats_collect $CFG_IMPL_RUN $CFG_OUT_DIR $vtag]
+                set vwns [dict get $vres wns]
+                set vpass [dict get $vres pass]
+                puts "  WNS=[ats_fmt $vwns]  PASS=$vpass"
 
-            ats_csv_row $CSV fine_verify 0 $fine_hi $vwns [dict get $vres whs] \
-                [dict get $vres lut] [dict get $vres ff] \
-                [dict get $vres b18] [dict get $vres b36] [dict get $vres dsp] \
-                0 [dict get $vres status] "verify_hi"
+                ats_csv_row $CSV fine_verify 0 $fine_hi $vwns [dict get $vres whs] \
+                    [dict get $vres lut] [dict get $vres ff] \
+                    [dict get $vres b18] [dict get $vres b36] [dict get $vres dsp] \
+                    0 [dict get $vres status] "verify_hi"
 
-            if {$vpass} {
-                set best_f $fine_hi
-            } else {
-                # Hi bound doesn't pass -- this is a REAL verified fail,
-                # so the new lo is confirmed.
-                puts "  WARNING: Hi bound fails."
-                puts "  Try a larger FINE_PERIOD_START, e.g. [ats_fmt [expr {$fine_hi + 1.0}]] ns"
-                set fine_lo $fine_hi
-                set lo_verified 1
-                set fine_hi [ats_clamp [expr {$fine_hi + 1.500}] $CFG_PERIOD_MIN $CFG_PERIOD_MAX]
-                puts "  Expanded hi to [ats_fmt $fine_hi] ns -- continuing..."
+                if {$vpass} {
+                    set best_f $fine_hi
+                } else {
+                    # Hi bound doesn't pass -- this is a REAL verified fail,
+                    # so the new lo is confirmed.
+                    puts "  WARNING: Hi bound fails."
+                    puts "  Try a larger FINE_PERIOD_START, e.g. [ats_fmt [expr {$fine_hi + 1.0}]] ns"
+                    set fine_lo $fine_hi
+                    set lo_verified 1
+                    set fine_hi [ats_clamp [expr {$fine_hi + 1.500}] $CFG_PERIOD_MIN $CFG_PERIOD_MAX]
+                    puts "  Expanded hi to [ats_fmt $fine_hi] ns -- continuing..."
+                }
             }
         }
     }
