@@ -9,11 +9,16 @@ Finds the true **maximum operating frequency (Fmax)** of your RTL design on Viva
 
 It runs three phases automatically:
 
-| Phase | Method | RERUN_SYNTH | Purpose |
-|-------|--------|-------------|---------|
-| **Coarse** | Direct estimation (Newton step) | Off (fast) | Find the approximate frequency range in 2-3 iterations |
-| **Fine** | Binary search | Off (fast) | Bracket the exact pass/fail boundary to +-0.025 ns |
-| **Validate** | Fixed period x N placer directives | On (accurate) | Confirm the result is not a lucky route |
+| Phase | Method | Purpose |
+|-------|--------|---------|
+| **Synth once** | `synth_1` from current sources | One netlist for the whole experiment |
+| **Coarse** | Direct estimation (Newton step) | Find the approximate frequency range in 2-3 iterations |
+| **Fine** | Binary search | Bracket the exact pass/fail boundary to +-0.025 ns |
+| **Validate** | Fixed period x N placer directives | Confirm the result is not a lucky placement |
+
+All phases implement the **same synthesized netlist** -- only the implementation
+clock constraint and the placer directive vary. Synthesis runs exactly once at
+the start of the experiment, from your current sources.
 
 ---
 
@@ -27,7 +32,8 @@ The only correct approach is to **re-run implementation at each period** and rea
 
 ## Prerequisites
 
-1. Vivado project (`.xpr`) with synthesis already run at least once.
+1. Vivado project (`.xpr`). Synthesis does NOT need to be pre-run -- the script
+   synthesizes once at the start from your current sources.
 2. Your base XDC must contain a direct `create_clock` line:
    ```xdc
    create_clock -name clk_172m -period 5.800000 [get_ports clk_i]
@@ -257,7 +263,7 @@ set CFG_COARSE_PERIOD_START  ""
 |-------|-----------|---------------|-------|
 | Coarse (no synth) | 2-3 typical | ~5-10 min | ~10-30 min |
 | Fine (no synth) | <= 14 | ~5-10 min | ~70-140 min |
-| Validate (with synth, 3 directives) | 3 | ~20-30 min | ~60-90 min |
+| Validate (3 directives) | 3 | ~5-10 min | ~15-30 min |
 | **Full pipeline** | -- | -- | **~2-4 hours** |
 
 > Artix-7 xc7a100t estimates for a design the size of HQC-192 (Karatsuba multiplier).
@@ -353,12 +359,23 @@ same period. Binary search is immune to this: it only cares whether a point pass
 or fails, not how much. It also guarantees convergence in `log2(range / resolution)`
 steps regardless of noise.
 
-**Why RERUN_SYNTH off for coarse and fine?**  
-In the search phases, the goal is to map the pass/fail boundary efficiently. Synthesis
-barely changes the critical path within a narrow frequency range — routing dominates.
-Turning synthesis on would 3× the runtime with little gain in accuracy.
+**Why synthesize only once?**  
+Synthesis is deterministic: identical sources, constraints, and settings always
+produce an identical netlist. Re-synthesizing per phase therefore never adds
+information -- but it adds two failure modes. First, if anything changed
+(sources edited, constraint picked up), the netlist silently switches
+mid-experiment: the search measured netlist A, validation measures netlist B,
+and the results are incomparable. The symptom is dramatic -- resources jump,
+WNS collapses -- and confusing, because the period is identical. Second, it
+multiplies runtime by ~3x for nothing. The script synthesizes exactly once at
+the start, from current sources, and every implementation in every phase uses
+that netlist.
 
-**Why RERUN_SYNTH on for validation?**  
-The validation results are what you report. Each directive run should be a fully independent,
-synthesis-aware implementation. This ensures the reported Fmax is not an artifact of
-a particular synthesis run.
+**Why is the adaptive clock implementation-only (`USED_IN_SYNTHESIS false`)?**  
+If the adaptive XDC drove synthesis, every period change would make the
+synthesis result stale, forcing re-synthesis and changing the netlist with
+the constraint -- the experiment would measure a moving target. Keeping it
+implementation-only means synthesis optimizes against your original clock
+constraint (a fixed target), and the sweep varies only the implementation
+constraint. For this reason, keep your original `create_clock` line in your
+XDC -- do not comment it out.

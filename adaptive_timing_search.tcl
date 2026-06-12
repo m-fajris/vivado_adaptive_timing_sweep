@@ -5,14 +5,18 @@
 # PURPOSE
 #   Finds the true Fmax of your RTL design by running a two-phase search:
 #
-#   PHASE 1  COARSE   Gradient descent from a slow clock.
-#                     Fast, RERUN_SYNTH off. Finds the approximate range.
+#   SYNTH ONCE        Synthesis runs exactly once at the start. All phases
+#                     implement the SAME netlist -- only the implementation
+#                     clock constraint and placer directive vary.
+#
+#   PHASE 1  COARSE   Pure Newton step from a slow clock.
+#                     Finds the approximate range in 2-3 implementations.
 #
 #   PHASE 2  FINE     Binary search within the coarse bracket.
-#                     Precise to 0.025 ns. RERUN_SYNTH off for speed.
+#                     Precise to 0.025 ns.
 #
-#   VALIDATE          Reruns the best period across multiple P&R seeds.
-#                     RERUN_SYNTH on. This is the number for your paper.
+#   VALIDATE          Reruns the best period across multiple placer
+#                     directives. This is the number for your paper.
 #
 #   The phases hand off automatically (full pipeline).
 #   Checkpoint is saved after every iteration -- crash-safe.
@@ -107,17 +111,18 @@ set CFG_OUT_DIR [file normalize "./adaptive_timing_search_out"]
 set C_CONVERGE_WNS 0.300   ;# ns -- coarse "close enough" tolerance
 set C_MAX_ITER     6       ;# Newton converges in 2-3, 6 is generous
 set C_MIN_STEP     0.050   ;# minimum step to prevent micro-oscillation
-set C_RERUN_SYNTH  0
 
 # FINE  --  binary search, synthesis not rerun (speed)
 # Convergence is gap-based: stops when hi - lo < F_MIN_STEP.
 # WNS magnitude at the boundary is whatever the router gives -- not controlled.
 set F_MAX_ITER        14    ;# log2(10 ns / 0.025 ns) ~ 9; 14 for safety
 set F_MIN_STEP        0.025 ;# resolution limit (ns)
-set F_RERUN_SYNTH     0
 
-# VALIDATION  --  fixed period, synthesis always rerun for clean result
-set V_RERUN_SYNTH  1
+# VALIDATION  --  fixed period, multiple placer directives, same netlist.
+# (No re-synthesis anywhere after the initial run: synthesis is deterministic,
+#  so re-running it with identical inputs gives an identical netlist -- and
+#  re-running it with CHANGED inputs would silently switch the netlist under
+#  the experiment. Both are wrong.)
 
 
 # ==============================================================================
@@ -297,9 +302,15 @@ proc ats_write_xdc {path port name period} {
 
 # Save checkpoint as a sourced TCL file.
 # Usage: ats_save_ckpt $path key1 val1 key2 val2 ...
+# The active CSV filename is always included so resume appends to the
+# same file instead of starting a new one.
 proc ats_save_ckpt {path args} {
+    global CSV
     set fp [open $path w]
     puts $fp "# adaptive_timing_search checkpoint -- do not edit manually"
+    if {[info exists CSV]} {
+        puts $fp "set CKPT_csv_file [list $CSV]"
+    }
     foreach {k v} $args {
         puts $fp "set CKPT_${k} [list $v]"
     }
@@ -499,8 +510,13 @@ if {[llength [get_files -quiet -of_objects $_cs $XDC_FILE]] == 0} {
     add_files -fileset $_cs -norecurse $XDC_FILE
 }
 set _xdc [get_files -of_objects $_cs $XDC_FILE]
-set_property USED_IN_SYNTHESIS      true $_xdc
-set_property USED_IN_IMPLEMENTATION true $_xdc
+# Implementation-only: the adaptive clock must NOT drive synthesis.
+# If it did, the first re-synthesis would produce a different netlist than
+# the one the search phases measured (synthesis optimizes differently per
+# clock target), silently invalidating the experiment. Synthesis keeps the
+# project's original clock constraint as a fixed optimization target.
+set_property USED_IN_SYNTHESIS      false $_xdc
+set_property USED_IN_IMPLEMENTATION true  $_xdc
 catch {set_property PROCESSING_ORDER LATE $_xdc}
 
 puts ""
@@ -514,10 +530,15 @@ foreach _f [get_files -quiet -of_objects $_cs] {
     }
 }
 
-# --- CSV init ---
-set CSV [file join $CFG_OUT_DIR "adaptive_summary.csv"]
+# --- CSV: timestamped per experiment ---
+# Each run gets its own file (adaptive_summary_YYYYMMDD_HHMMSS.csv), so several
+# results can be open in Excel at once without renaming, and a locked old file
+# can never block a new run. The active name is stored in the checkpoint so a
+# resumed run appends to its own CSV.
+set CSV ""
 
 # --- Checkpoint state variables (defaults for fresh run) ---
+set CKPT_csv_file        ""
 set CKPT_coarse_done     0
 set CKPT_best_coarse     "NA"
 set CKPT_best_coarse_wns "NA"
@@ -545,11 +566,51 @@ if {[file exists $CKPT_FILE]} {
     }
 }
 
-if {!$_resumed} {
-    # Fresh run: initialise CSV.
+if {$_resumed && $CKPT_csv_file ne ""} {
+    # Continue appending to this experiment's CSV.
+    set CSV $CKPT_csv_file
+    puts "CSV (resumed): [file tail $CSV]"
+} else {
+    # Fresh run (or old-format checkpoint): new timestamped CSV.
+    set _ts [clock format [clock seconds] -format "%Y%m%d_%H%M%S"]
+    set CSV [file join $CFG_OUT_DIR "adaptive_summary_${_ts}.csv"]
     set fp [open $CSV w]
     puts $fp "phase,iter,period_ns,freq_mhz,wns_ns,whs_ns,lut,ff,bram18,bram36,dsp,seed,status,decision"
     close $fp
+    puts "CSV: [file tail $CSV]"
+}
+
+
+# ==============================================================================
+# SYNTHESIZE ONCE
+# ==============================================================================
+# Synthesis runs exactly once per experiment, from the CURRENT sources, before
+# any search begins. Every phase (coarse, fine, validation) then implements
+# this same netlist -- only the implementation clock and placer directive vary.
+#
+# Why this matters: using a pre-existing synth result risks measuring a STALE
+# netlist (synthesized from older RTL or different settings). The mismatch is
+# invisible during the search and only surfaces later as inexplicable results
+# -- e.g. validation resources doubling and WNS collapsing. Re-synthesizing
+# per-phase is equally wrong: synthesis with identical inputs is deterministic
+# (pure waste), and with changed inputs it switches the netlist mid-experiment.
+#
+# On resume, synthesis from this experiment already exists and is skipped.
+
+if {!$_resumed} {
+    ats_banner "SYNTHESIS  --  once, current sources"
+    puts "All phases will implement this netlist."
+    reset_run $CFG_SYNTH_RUN
+    launch_runs $CFG_SYNTH_RUN -jobs $CFG_JOBS
+    wait_on_run $CFG_SYNTH_RUN
+    set _ss [get_property STATUS [get_runs $CFG_SYNTH_RUN]]
+    puts "Synthesis: $_ss"
+    if {[string first "ERROR" [string toupper $_ss]] >= 0} {
+        error "Synthesis failed -- fix the design before running the search."
+    }
+} else {
+    puts ""
+    puts "Resume: using the netlist synthesized by this experiment earlier."
 }
 
 
@@ -576,7 +637,7 @@ if {($SWEEP_MODE eq "full" || $SWEEP_MODE eq "coarse") && !$CKPT_coarse_done} {
 
         ats_write_xdc $XDC_FILE $CFG_CLK_PORT $CLK_NAME $period
 
-        set rr [ats_run_impl $CFG_SYNTH_RUN $CFG_IMPL_RUN $CFG_JOBS $C_RERUN_SYNTH]
+        set rr [ats_run_impl $CFG_SYNTH_RUN $CFG_IMPL_RUN $CFG_JOBS 0]
         if {![dict get $rr ok]} {
             puts "  Run error -- aborting coarse phase."
             break
@@ -760,7 +821,7 @@ if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
             # Manual FINE_PERIOD_START: implement once to confirm it passes.
             puts "Verifying hi bound: [ats_fmt $fine_hi] ns  ([ats_mhz $fine_hi])"
             ats_write_xdc $XDC_FILE $CFG_CLK_PORT $CLK_NAME $fine_hi
-            set rr [ats_run_impl $CFG_SYNTH_RUN $CFG_IMPL_RUN $CFG_JOBS $F_RERUN_SYNTH]
+            set rr [ats_run_impl $CFG_SYNTH_RUN $CFG_IMPL_RUN $CFG_JOBS 0]
 
             if {[dict get $rr ok]} {
                 set vtag [format "fine_hi_verify_%s" [regsub -all {[^0-9]} [ats_fmt $fine_hi] "_"]]
@@ -835,7 +896,7 @@ if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
 
         ats_write_xdc $XDC_FILE $CFG_CLK_PORT $CLK_NAME $mid
 
-        set rr [ats_run_impl $CFG_SYNTH_RUN $CFG_IMPL_RUN $CFG_JOBS $F_RERUN_SYNTH]
+        set rr [ats_run_impl $CFG_SYNTH_RUN $CFG_IMPL_RUN $CFG_JOBS 0]
         if {![dict get $rr ok]} {
             puts "  Run error -- treating as fail, moving lo up."
             set fine_lo $mid
@@ -906,7 +967,6 @@ if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
 
         ats_banner "VALIDATION  --  [ats_fmt $best_f] ns  ([ats_mhz $best_f])  x[llength $CFG_VALIDATION_DIRECTIVES] directives"
         puts "Directives: $CFG_VALIDATION_DIRECTIVES"
-        puts "RERUN_SYNTH: $V_RERUN_SYNTH"
 
         # Restore accumulated results from checkpoint (resume case).
         set val_wns  $CKPT_val_wns_list
@@ -932,7 +992,7 @@ if {$SWEEP_MODE eq "full" || $SWEEP_MODE eq "fine"} {
             ats_set_directive $CFG_IMPL_RUN $directive
             ats_write_xdc $XDC_FILE $CFG_CLK_PORT $CLK_NAME $best_f
 
-            set rr [ats_run_impl $CFG_SYNTH_RUN $CFG_IMPL_RUN $CFG_JOBS $V_RERUN_SYNTH]
+            set rr [ats_run_impl $CFG_SYNTH_RUN $CFG_IMPL_RUN $CFG_JOBS 0]
             if {![dict get $rr ok]} {
                 puts "  Run error on directive '$directive' -- skipping."
                 continue
